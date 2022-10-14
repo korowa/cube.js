@@ -161,7 +161,8 @@ const BasePreAggregationWithoutPartitionGranularity = {
       sql: Joi.func().required()
     }),
     Joi.object().keys({
-      columns: Joi.func().required()
+      columns: Joi.func().required(),
+      type: Joi.any().valid('regular', 'aggregate'),
     })
   )),
   // refreshRange was deprecated
@@ -179,7 +180,6 @@ const BasePreAggregationWithoutPartitionGranularity = {
     sql: Joi.func().required()
   },
   readOnly: Joi.boolean().strict(),
-  unionWithSourceData: Joi.boolean().strict(),
 };
 
 const BasePreAggregation = {
@@ -211,7 +211,7 @@ const OriginalSqlSchema = condition(
   ),
   inherit(BasePreAggregationWithoutPartitionGranularity, {
     type: Joi.any().valid('originalSql').required(),
-    uniqueKeyColumns: Joi.array().items(Joi.string()),
+    uniqueKeyColumns: Joi.array().items(Joi.string())
   }),
 );
 
@@ -288,6 +288,28 @@ const RollUpJoinSchema = condition(
   )
 );
 
+const RollupLambdaSchema = condition(
+  (s) => defined(s.granularity) || defined(s.timeDimension),
+  {
+    type: Joi.any().valid('rollupLambda').required(),
+    granularity: GranularitySchema,
+    timeDimension: Joi.func().required(),
+    rollups: Joi.func().required(),
+    measures: Joi.func(),
+    dimensions: Joi.func(),
+    segments: Joi.func(),
+    unionWithSourceData: Joi.boolean().strict(),
+  },
+  {
+    type: Joi.any().valid('rollupLambda').required(),
+    rollups: Joi.func().required(),
+    measures: Joi.func(),
+    dimensions: Joi.func(),
+    segments: Joi.func(),
+    unionWithSourceData: Joi.boolean().strict(),
+  },
+);
+
 const RollUpSchema = condition(
   (s) => defined(s.granularity) || defined(s.timeDimension) || defined(s.timeDimensionReference),
   condition(
@@ -337,6 +359,7 @@ const PreAggregationsAlternatives = Joi.object().pattern(
         { is: 'autoRollup', then: AutoRollupSchema },
         { is: 'originalSql', then: OriginalSqlSchema },
         { is: 'rollupJoin', then: RollUpJoinSchema },
+        { is: 'rollupLambda', then: RollupLambdaSchema },
         { is: 'rollup',
           then: RollUpSchema,
           otherwise: Joi.object().keys({
@@ -409,7 +432,15 @@ const MeasuresSchema = Joi.object().pattern(identifierRegex, Joi.alternatives().
 
 const cubeSchema = Joi.object().keys({
   name: identifier,
-  sql: Joi.func().required(),
+  sql: Joi.alternatives().conditional(
+    Joi.ref('..isView'), [
+      {
+        is: true,
+        then: Joi.forbidden(),
+        otherwise: Joi.func().required()
+      }
+    ]
+  ),
   refreshKey: CubeRefreshKeySchema,
   fileName: Joi.string().required(),
   extends: Joi.func(),
@@ -419,6 +450,7 @@ const cubeSchema = Joi.object().keys({
   dataSource: Joi.string(),
   description: Joi.string(),
   rewriteQueries: Joi.boolean().strict(),
+  isView: Joi.boolean().strict(),
   joins: Joi.object().pattern(identifierRegex, Joi.object().keys({
     sql: Joi.func().required(),
     relationship: Joi.any().valid('hasMany', 'belongsTo', 'hasOne').required()
@@ -465,7 +497,9 @@ const cubeSchema = Joi.object().keys({
     description: Joi.string(),
     meta: Joi.any()
   })),
-  preAggregations: PreAggregationsAlternatives
+  preAggregations: PreAggregationsAlternatives,
+  includes: Joi.func(),
+  excludes: Joi.func(),
 });
 
 function formatErrorMessageFromDetails(explain, d) {

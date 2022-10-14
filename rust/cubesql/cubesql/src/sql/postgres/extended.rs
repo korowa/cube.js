@@ -7,14 +7,15 @@ use crate::{
     },
     CubeError,
 };
+use chrono::{DateTime, Utc};
 use datafusion::arrow::record_batch::RecordBatch;
-use pg_srv::{protocol, BindValue, ProtocolError};
+use pg_srv::{protocol, BindValue, PgTypeId, ProtocolError};
 use sqlparser::ast;
 use std::fmt;
 
 use crate::sql::shim::{ConnectionError, QueryPlanExt};
 use datafusion::{dataframe::DataFrame as DFDataFrame, physical_plan::SendableRecordBatchStream};
-use futures::StreamExt;
+use futures::*;
 use pg_srv::protocol::{PortalCompletion, PortalSuspended};
 
 #[derive(Debug)]
@@ -28,21 +29,70 @@ pub struct Cursor {
 }
 
 #[derive(Debug)]
-pub struct PreparedStatement {
-    pub query: ast::Statement,
-    pub parameters: protocol::ParameterDescription,
-    // Fields which will be returned to the client, It can be None if server doesnt return any field
-    // for example BEGIN
-    pub description: Option<protocol::RowDescription>,
+pub enum PreparedStatement {
+    // Postgres allows to define prepared statement on empty query: "",
+    // then it requires special handling in the protocol
+    Empty {
+        /// Prepared statement can be declared from SQL or protocol (Parser)
+        from_sql: bool,
+        created: DateTime<Utc>,
+    },
+    Query {
+        /// Prepared statement can be declared from SQL or protocol (Parser)
+        from_sql: bool,
+        created: DateTime<Utc>,
+        query: ast::Statement,
+        parameters: protocol::ParameterDescription,
+        /// Fields which will be returned to the client, It can be None if server doesnt return any field
+        /// for example BEGIN
+        description: Option<protocol::RowDescription>,
+    },
 }
 
 impl PreparedStatement {
-    pub fn bind(&self, values: Vec<BindValue>) -> Result<ast::Statement, ConnectionError> {
-        let binder = PostgresStatementParamsBinder::new(values);
-        let mut statement = self.query.clone();
-        binder.bind(&mut statement)?;
+    pub fn get_created(&self) -> &DateTime<Utc> {
+        match self {
+            PreparedStatement::Empty { created, .. } => created,
+            PreparedStatement::Query { created, .. } => created,
+        }
+    }
 
-        Ok(statement)
+    /// Format parser ast::Statement as String
+    pub fn get_query_as_string(&self) -> String {
+        match self {
+            PreparedStatement::Empty { .. } => "".to_string(),
+            PreparedStatement::Query { query, .. } => query.to_string(),
+        }
+    }
+
+    pub fn get_from_sql(&self) -> bool {
+        match self {
+            PreparedStatement::Empty { from_sql, .. } => from_sql.clone(),
+            PreparedStatement::Query { from_sql, .. } => from_sql.clone(),
+        }
+    }
+
+    pub fn get_parameters(&self) -> Option<&Vec<PgTypeId>> {
+        match self {
+            PreparedStatement::Empty { .. } => None,
+            PreparedStatement::Query { parameters, .. } => Some(&parameters.parameters),
+        }
+    }
+
+    pub fn bind(&self, values: Vec<BindValue>) -> Result<ast::Statement, ConnectionError> {
+        match self {
+            PreparedStatement::Empty { .. } => Err(CubeError::internal(
+                "It's not possible bind empty prepared statement (it's a bug)".to_string(),
+            )
+            .into()),
+            PreparedStatement::Query { query, .. } => {
+                let binder = PostgresStatementParamsBinder::new(values);
+                let mut statement = query.clone();
+                binder.bind(&mut statement)?;
+
+                Ok(statement)
+            }
+        }
     }
 }
 
@@ -104,6 +154,7 @@ impl fmt::Debug for InExecutionStreamState {
 
 #[derive(Debug)]
 pub enum PortalState {
+    Empty,
     Prepared(PreparedState),
     #[allow(dead_code)]
     InExecutionFrame(InExecutionFrameState),
@@ -139,15 +190,33 @@ impl Portal {
         }
     }
 
+    pub fn new_empty(format: protocol::Format, from: PortalFrom) -> Self {
+        Self {
+            format,
+            from,
+            state: Some(PortalState::Empty),
+        }
+    }
+
     pub fn get_description(&self) -> Result<Option<protocol::RowDescription>, ConnectionError> {
         match &self.state {
             Some(PortalState::Prepared(state)) => state.plan.to_row_description(self.format),
             Some(PortalState::InExecutionFrame(state)) => Ok(state.description.clone()),
             Some(PortalState::InExecutionStream(state)) => Ok(state.description.clone()),
             Some(PortalState::Finished(state)) => Ok(state.description.clone()),
-            _ => Err(ConnectionError::Cube(CubeError::internal(
+            Some(PortalState::Empty) => Err(ConnectionError::Cube(CubeError::internal(
+                "Unable to get description on empty Portal. It's a bug.".to_string(),
+            ))),
+            None => Err(ConnectionError::Cube(CubeError::internal(
                 "Unable to get description on Portal without state. It's a bug.".to_string(),
             ))),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match &self.state {
+            Some(PortalState::Empty) => true,
+            _ => false,
         }
     }
 
@@ -332,68 +401,86 @@ impl Portal {
         writer: &mut BatchWriter,
         max_rows: usize,
     ) -> Result<protocol::PortalCompletion, ConnectionError> {
-        if let Some(state) = self.state.take() {
-            match state {
-                PortalState::Prepared(state) => {
-                    let description = state.plan.to_row_description(self.format)?;
-                    match state.plan {
-                        QueryPlan::MetaOk(_, completion) => {
-                            self.state = Some(PortalState::Finished(FinishedState { description }));
+        let state = self
+            .state
+            .take()
+            .ok_or_else(|| CubeError::internal("Unable to take portal state".to_string()))?;
 
-                            Ok(PortalCompletion::Complete(
-                                completion.clone().to_pg_command(),
-                            ))
-                        }
-                        QueryPlan::MetaTabular(_, batch) => {
-                            let new_state = InExecutionFrameState::new(*batch, description);
-                            let (next_state, complete) = self
-                                .hand_execution_frame_state(writer, new_state, max_rows)
-                                .await?;
+        match state {
+            PortalState::Empty => {
+                self.state = Some(PortalState::Empty);
 
-                            self.state = Some(next_state);
+                Err(
+                    CubeError::internal("Unable to execute empty portal, it's a bug".to_string())
+                        .into(),
+                )
+            }
+            PortalState::Prepared(state) => {
+                let description = state.plan.to_row_description(self.format)?;
+                match state.plan {
+                    QueryPlan::MetaOk(_, completion) => {
+                        self.state = Some(PortalState::Finished(FinishedState { description }));
 
-                            Ok(complete)
-                        }
-                        QueryPlan::DataFusionSelect(_, plan, ctx) => {
-                            let df = DFDataFrame::new(ctx.state.clone(), &plan);
-                            let stream = df.execute_stream().await?;
+                        Ok(PortalCompletion::Complete(
+                            completion.clone().to_pg_command(),
+                        ))
+                    }
+                    QueryPlan::MetaTabular(_, batch) => {
+                        let new_state = InExecutionFrameState::new(*batch, description);
+                        let (next_state, complete) = self
+                            .hand_execution_frame_state(writer, new_state, max_rows)
+                            .await?;
 
-                            let new_state = InExecutionStreamState::new(stream, description);
-                            let (next_state, complete) = self
-                                .hand_execution_stream_state(writer, new_state, max_rows)
-                                .await?;
-                            self.state = Some(next_state);
+                        self.state = Some(next_state);
 
-                            Ok(complete)
+                        Ok(complete)
+                    }
+                    QueryPlan::DataFusionSelect(_, plan, ctx) => {
+                        let df = DFDataFrame::new(ctx.state.clone(), &plan);
+                        let safe_stream = async move {
+                            std::panic::AssertUnwindSafe(df.execute_stream())
+                                .catch_unwind()
+                                .await
+                        };
+                        match safe_stream.await {
+                            Ok(sendable_batch) => {
+                                let new_state =
+                                    InExecutionStreamState::new(sendable_batch?, description);
+                                let (next_state, complete) = self
+                                    .hand_execution_stream_state(writer, new_state, max_rows)
+                                    .await?;
+                                self.state = Some(next_state);
+
+                                Ok(complete)
+                            }
+                            Err(err) => Err(CubeError::panic(err).into()),
                         }
                     }
                 }
-                PortalState::InExecutionFrame(frame_state) => {
-                    let (next_state, complete) = self
-                        .hand_execution_frame_state(writer, frame_state, max_rows)
-                        .await?;
-
-                    self.state = Some(next_state);
-
-                    Ok(complete)
-                }
-                PortalState::InExecutionStream(stream_state) => {
-                    let (next_state, complete) = self
-                        .hand_execution_stream_state(writer, stream_state, max_rows)
-                        .await?;
-
-                    self.state = Some(next_state);
-
-                    Ok(complete)
-                }
-                PortalState::Finished(finish_state) => {
-                    self.state = Some(PortalState::Finished(finish_state));
-
-                    Ok(self.new_portal_completion(0, false))
-                }
             }
-        } else {
-            unreachable!();
+            PortalState::InExecutionFrame(frame_state) => {
+                let (next_state, complete) = self
+                    .hand_execution_frame_state(writer, frame_state, max_rows)
+                    .await?;
+
+                self.state = Some(next_state);
+
+                Ok(complete)
+            }
+            PortalState::InExecutionStream(stream_state) => {
+                let (next_state, complete) = self
+                    .hand_execution_stream_state(writer, stream_state, max_rows)
+                    .await?;
+
+                self.state = Some(next_state);
+
+                Ok(complete)
+            }
+            PortalState::Finished(finish_state) => {
+                self.state = Some(PortalState::Finished(finish_state));
+
+                Ok(self.new_portal_completion(0, false))
+            }
         }
     }
 }
